@@ -24,6 +24,7 @@ Lidar indeksid (720 kiirt, 360°):
   Ette ±15° = indeksid 330..390 (ümber 360)
 """
 import rclpy
+import math
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
@@ -34,71 +35,140 @@ class FolkraceDriver(Node):
     def __init__(self):
         super().__init__('folkrace_driver')
 
-        # Publisher liikumiskäskude jaoks
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
-        # Subscriber lidari andmete jaoks
         self.sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, 10)
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            10
+        )
 
         self.get_logger().info('Folkrace driver käivitatud!')
 
+    def valid_values(self, ranges, start, end):
+        values = []
+
+        for r in ranges[start:end]:
+            if math.isfinite(r) and 0.12 < r < 8.0:
+                values.append(r)
+
+        return values
+
+    def sector_min(self, ranges, start, end, default=8.0):
+        values = self.valid_values(ranges, start, end)
+
+        if len(values) == 0:
+            return default
+
+        return min(values)
+
+    def sector_avg(self, ranges, start, end, default=8.0):
+        values = self.valid_values(ranges, start, end)
+
+        if len(values) == 0:
+            return default
+
+        return sum(values) / len(values)
+
+    def clamp(self, value, min_value, max_value):
+        return max(min(value, max_value), min_value)
+
     def scan_callback(self, msg):
         ranges = msg.ranges
-        n = len(ranges)
 
-        # ----------------------------------------------------------
-        # 1. Loe lidar andmeid: ees, vasakul, paremal
-        # ----------------------------------------------------------
+        front = self.sector_min(ranges, 350, 370)
 
-        # TODO: arvuta kaugus ETTE (±15° ehk ~30 kiirt ette suunas)
-        #   Indeksid: ranges[n//2-15:n//2+15] (ümber keskpunkti)
-        #   Kasuta min() et leida lähim takistus
-        #   Filtreeri välja inf ja liiga lähedad (< 0.12m)
-        #
-        # Vihje:
-        #   mid = n // 2
-        #   front_ranges = ranges[mid-15:mid+15]
-        #   front = min((r for r in front_ranges if 0.12 < r < 8.0), default=8.0)
-        front = 8.0  # TODO: asenda seda üleval oleva koodiga
+        front_left = self.sector_min(ranges, 385, 470)
+        front_right = self.sector_min(ranges, 250, 335)
 
-        # TODO: arvuta kaugus VASAKULE (~90° ehk indeksid 3*n//4 - 10 .. 3*n//4 + 10)
-        # Vihje: left = min((r for r in ranges[530:550] if 0.12 < r < 8.0), default=8.0)
-        left = 8.0  # TODO: asenda
+        left = self.sector_avg(ranges, 500, 620)
+        right = self.sector_avg(ranges, 100, 220)
 
-        # TODO: arvuta kaugus PAREMALE (~-90° ehk indeksid n//4 - 10 .. n//4 + 10)
-        # Vihje: right = min((r for r in ranges[170:190] if 0.12 < r < 8.0), default=8.0)
-        right = 8.0  # TODO: asenda
-
-        # ----------------------------------------------------------
-        # 2. Otsusta kuhu sõita
-        # ----------------------------------------------------------
         cmd = Twist()
 
-        # TODO: kirjuta reaktiivne loogika
-        #
-        # Põhimõte:
-        #   - Kui ees on vaba (front > 0.5m): sõida edasi
-        #     * cmd.linear.x = 0.3  (edasi kiirus m/s)
-        #     * Hoia raja keskel: kui left > right, kalluta vasakule
-        #       cmd.angular.z = 0.2 (positiivne = vasakule)
-        #
-        #   - Kui ees on takistus (front <= 0.5m): peatu ja pöördu
-        #     * cmd.linear.x = 0.0
-        #     * Pöördu vabama külje poole:
-        #       cmd.angular.z = 0.8 kui left > right, muidu -0.8
-        #
-        # Vihje: alusta lihtsa if/else'iga, siis täiusta
+        
+        bridge_like = (
+            front < 0.75 and
+            front_left > 0.45 and
+            front_right > 0.45 and
+            left > 0.45 and
+            right > 0.45
+        )
 
-        # ----------------------------------------------------------
-        # 3. Saada käsk robotile
-        # ----------------------------------------------------------
+        
+        real_wall_ahead = (
+            front < 0.35 and
+            not bridge_like and
+            (front_left < 0.45 or front_right < 0.45)
+        )
+
+        if real_wall_ahead:
+            cmd.linear.x = -0.08
+
+            if front_left > front_right:
+                cmd.angular.z = -1.0
+            else:
+                cmd.angular.z = 1.0
+
+        elif front < 0.60 and not bridge_like:
+            cmd.linear.x = 0.07
+
+            if front_left > front_right:
+                cmd.angular.z = -1.0
+            else:
+                cmd.angular.z = 1.0
+
+        
+        elif front_left < 0.42:
+            cmd.linear.x = 0.14
+            cmd.angular.z = 0.75
+
+        
+        elif front_right < 0.42:
+            cmd.linear.x = 0.14
+            cmd.angular.z = -0.75
+
+        else:
+           
+            center_error = right - left
+
+            cmd.linear.x = 0.24
+            cmd.angular.z = 0.38 * center_error
+
+          
+            if front_left < 0.65:
+                cmd.angular.z += 0.30
+
+            if front_right < 0.65:
+                cmd.angular.z -= 0.30
+
+          
+            if bridge_like:
+                cmd.linear.x = 0.18
+                cmd.angular.z = self.clamp(cmd.angular.z, -0.35, 0.35)
+            else:
+                cmd.angular.z = self.clamp(cmd.angular.z, -0.85, 0.85)
+
+            if front < 1.0:
+                cmd.linear.x = min(cmd.linear.x, 0.18)
+
         self.pub.publish(cmd)
 
 
 def main(args=None):
     rclpy.init(args=args)
+
     node = FolkraceDriver()
-    rclpy.spin(node)
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
     node.destroy_node()
     rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
